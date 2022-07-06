@@ -155,6 +155,8 @@ struct bearer_state {
 	bool connected;
 	bool svc_resolved;
 	bool initiator;
+	bool connectable;
+	time_t last_seen;
 };
 
 struct csrk_info {
@@ -254,9 +256,6 @@ struct btd_device {
 	uint8_t ltk_enc_size;
 
 	sdp_list_t	*tmp_records;
-
-	time_t		bredr_seen;
-	time_t		le_seen;
 
 	gboolean	trusted;
 	gboolean	blocked;
@@ -2273,14 +2272,14 @@ static uint8_t select_conn_bearer(struct btd_device *dev)
 	if (dev->bdaddr_type == BDADDR_LE_RANDOM)
 		return dev->bdaddr_type;
 
-	if (dev->bredr_seen) {
-		bredr_last = current - dev->bredr_seen;
+	if (dev->bredr_state.last_seen) {
+		bredr_last = current - dev->bredr_state.last_seen;
 		if (bredr_last > SEEN_TRESHHOLD)
 			bredr_last = NVAL_TIME;
 	}
 
-	if (dev->le_seen) {
-		le_last = current - dev->le_seen;
+	if (dev->le_state.last_seen) {
+		le_last = current - dev->le_state.last_seen;
 		if (le_last > SEEN_TRESHHOLD)
 			le_last = NVAL_TIME;
 	}
@@ -3022,7 +3021,7 @@ void device_add_connection(struct btd_device *dev, uint8_t bdaddr_type)
 {
 	struct bearer_state *state = get_state(dev, bdaddr_type);
 
-	device_update_last_seen(dev, bdaddr_type);
+	device_update_last_seen(dev, bdaddr_type, true);
 
 	if (state->connected) {
 		char addr[18];
@@ -3074,7 +3073,8 @@ static void set_temporary_timer(struct btd_device *dev, unsigned int timeout)
 								dev, NULL);
 }
 
-void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type)
+void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type,
+								bool *remove)
 {
 	struct bearer_state *state = get_state(device, bdaddr_type);
 	DBusMessage *reply;
@@ -3151,7 +3151,7 @@ void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type)
 	if (device->bredr_state.connected || device->le_state.connected)
 		return;
 
-	device_update_last_seen(device, bdaddr_type);
+	device_update_last_seen(device, bdaddr_type, true);
 
 	g_slist_free_full(device->eir_uuids, g_free);
 	device->eir_uuids = NULL;
@@ -3160,7 +3160,7 @@ void device_remove_connection(struct btd_device *device, uint8_t bdaddr_type)
 						DEVICE_INTERFACE, "Connected");
 
 	if (remove_device)
-		set_temporary_timer(device, 0);
+		*remove = remove_device;
 }
 
 guint device_add_disconnect_watch(struct btd_device *device,
@@ -4089,8 +4089,8 @@ bool device_is_name_resolve_allowed(struct btd_device *device)
 	/* now >= failed_time + name_request_retry_delay, meaning the
 	 * period of not sending name request is over.
 	 */
-	if (now.tv_sec >= device->name_resolve_failed_time +
-					btd_opts.name_request_retry_delay)
+	if (now.tv_sec >= (time_t)(device->name_resolve_failed_time +
+					btd_opts.name_request_retry_delay))
 		return true;
 
 	return false;
@@ -4168,7 +4168,7 @@ void device_update_addr(struct btd_device *device, const bdaddr_t *bdaddr,
 
 void device_set_bredr_support(struct btd_device *device)
 {
-	if (device->bredr)
+	if (btd_opts.mode == BT_MODE_LE || device->bredr)
 		return;
 
 	device->bredr = true;
@@ -4177,7 +4177,7 @@ void device_set_bredr_support(struct btd_device *device)
 
 void device_set_le_support(struct btd_device *device, uint8_t bdaddr_type)
 {
-	if (device->le)
+	if (btd_opts.mode == BT_MODE_BREDR || device->le)
 		return;
 
 	device->le = true;
@@ -4186,12 +4186,15 @@ void device_set_le_support(struct btd_device *device, uint8_t bdaddr_type)
 	store_device_info(device);
 }
 
-void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type)
+void device_update_last_seen(struct btd_device *device, uint8_t bdaddr_type,
+							bool connectable)
 {
-	if (bdaddr_type == BDADDR_BREDR)
-		device->bredr_seen = time(NULL);
-	else
-		device->le_seen = time(NULL);
+	struct bearer_state *state;
+
+	state = get_state(device, bdaddr_type);
+
+	state->last_seen = time(NULL);
+	state->connectable = connectable;
 
 	if (!device_is_temporary(device))
 		return;
@@ -4278,7 +4281,7 @@ static void delete_folder_tree(const char *dirname)
 		if (entry->d_type == DT_UNKNOWN)
 			entry->d_type = util_get_dt(dirname, entry->d_name);
 
-		create_filename(filename, PATH_MAX, "%s/%s", dirname,
+		snprintf(filename, PATH_MAX, "%s/%s", dirname,
 				entry->d_name);
 
 		if (entry->d_type == DT_DIR)
@@ -5902,14 +5905,17 @@ void device_set_flags(struct btd_device *device, uint8_t flags)
 
 bool device_is_connectable(struct btd_device *device)
 {
+	struct bearer_state *state;
+
 	if (!device)
 		return false;
 
 	if (device->bredr)
 		return true;
 
-	/* Check if either Limited or General discoverable are set */
-	return (device->ad_flags[0] & 0x03);
+	state = get_state(device, device->bdaddr_type);
+
+	return state->connectable;
 }
 
 static bool start_discovery(gpointer user_data)
